@@ -1,8 +1,6 @@
 ﻿using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using SleepSweetly.Models;
 
@@ -14,7 +12,7 @@ namespace SleepSweetly.Infrastructure.Services
         private const string PowerCfgArguments = "-requests";
 
         /// <summary>
-        /// Получает список блокирующих сон процессов
+        /// Получает список процессов, блокирующих сон
         /// </summary>
         public async Task<ScanResult> GetBlockingRequestsAsync()
         {
@@ -22,8 +20,20 @@ namespace SleepSweetly.Infrastructure.Services
             {
                 try
                 {
-                    var output = ExecutePowerCfg();
-                    var requests = ParsePowerCfgOutput(output);
+                    var result = GetBlockingApps();
+
+                    if (result == "CLEAR")
+                    {
+                        return new ScanResult
+                        {
+                            HasBlockers = false,
+                            BlockingRequests = new System.Collections.Generic.List<PowerRequest>(),
+                            ScanTime = DateTime.Now
+                        };
+                    }
+
+                    var requests = ParseOldFormat(result);
+
                     return new ScanResult
                     {
                         HasBlockers = requests.Count > 0,
@@ -44,164 +54,126 @@ namespace SleepSweetly.Infrastructure.Services
         }
 
         /// <summary>
-        /// Выполняет команду powercfg -requests
+        /// Запуск команды
         /// </summary>
-        private string ExecutePowerCfg()
+        private string GetBlockingApps()
         {
-            var psi = new ProcessStartInfo
+            try
             {
-                FileName = PowerCfgCommand,
-                Arguments = PowerCfgArguments,
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                StandardOutputEncoding = Encoding.UTF8
-            };
+                var psi = new ProcessStartInfo
+                {
+                    FileName = PowerCfgCommand,
+                    Arguments = PowerCfgArguments,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    StandardOutputEncoding = Encoding.UTF8
+                };
 
-            using (var process = Process.Start(psi))
+                using (var process = Process.Start(psi))
+                {
+                    var output = process.StandardOutput.ReadToEnd();
+                    process.WaitForExit();
+                    return ParsePowerRequests(output);
+                }
+            }
+            catch (Exception ex)
             {
-                if (process == null)
-                    return string.Empty;
-
-                var output = process.StandardOutput.ReadToEnd();
-                process.WaitForExit(5000);
-                return output ?? string.Empty;
+                return $"ERROR:{ex.Message}";
             }
         }
 
         /// <summary>
-        /// Парсит вывод powercfg в список блокировок
+        /// Парсит вывод powercfg в упрощенный формат
         /// </summary>
-        /// <param name="output">Вывод команды powercfg -requests</param>
-        private List<PowerRequest> ParsePowerCfgOutput(string output)
+        /// <param name="output">Сырой вывод powercfg -requests</param>
+        /// <returns>Строка с блокировками в формате [категория]\nпроцесс\n\n или "CLEAR"</returns>
+        private string ParsePowerRequests(string output)
         {
-            var requests = new List<PowerRequest>();
-            if (string.IsNullOrEmpty(output))
-                return requests;
+            var lines = output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            var result = new StringBuilder();
+            string currentCategory = null;
+            bool hasBlockers = false;
 
-            var lines = output.Split(new[] { "\r\n", "\n" }, StringSplitOptions.RemoveEmptyEntries);
-            PowerCategory currentCategory = PowerCategory.Unknown;
-
-            foreach (var line in lines)
+            foreach (var raw in lines)
             {
-                if (TryParseCategory(line, out var category))
-                {
-                    currentCategory = category;
+                var line = raw.Trim();
 
+                if (string.IsNullOrWhiteSpace(line))
+                    continue;
+
+                if (line.EndsWith(":"))
+                {
+                    var cat = line.TrimEnd(':').Trim();
+                    if (cat == "DISPLAY" || cat == "SYSTEM" || cat == "AWAYMODE" ||
+                        cat == "ВЫПОЛНЕНИЕ" || cat == "EXECUTION")
+                    {
+                        currentCategory = cat;
+                    }
                     continue;
                 }
 
-                if (TryParseProcessRequest(line, out var procName, out var procPath))
+                if (line.Contains("[PROCESS]") || line.Contains("[ПРОЦЕСС]"))
                 {
-                    requests.Add(new PowerRequest
+                    var process = line.Replace("[PROCESS]", "").Replace("[ПРОЦЕСС]", "").Trim();
+                    if (!string.IsNullOrWhiteSpace(process))
                     {
-                        Category = currentCategory,
-                        ProcessName = procName ?? "Unknown",
-                        ExecutablePath = procPath,
-                        RawDescription = line.Trim()
-                    });
+                        hasBlockers = true;
+                        result.AppendLine($"[{currentCategory}]");
+                        result.AppendLine(process);
+                        result.AppendLine();
+                    }
+                    continue;
                 }
 
-                else if (TryParseGenericRequest(line, out var desc))
+                if (currentCategory != null && (line.Contains(".exe") || line.Contains("\\Device")))
+                {
+                    hasBlockers = true;
+                    result.AppendLine($"[{currentCategory}]");
+                    result.AppendLine(line);
+                    result.AppendLine();
+                }
+            }
+
+            return hasBlockers ? result.ToString() : "CLEAR";
+        }
+
+        /// <summary>
+        /// Преобразует упрощенный формат в список PowerRequest
+        /// </summary>
+        /// <param name="data">Строка с блокировками в формате [категория]\nпроцесс\n\n</param>
+        private System.Collections.Generic.List<PowerRequest> ParseOldFormat(string data)
+        {
+            var requests = new System.Collections.Generic.List<PowerRequest>();
+            var lines = data.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+            string currentCategory = null;
+
+            foreach (var line in lines)
+            {
+                if (line.StartsWith("[") && line.EndsWith("]"))
+                {
+                    currentCategory = line.Trim('[', ']');
+                }
+                else if (!string.IsNullOrWhiteSpace(line) && currentCategory != null)
                 {
                     requests.Add(new PowerRequest
                     {
-                        Category = currentCategory,
-                        RawDescription = desc,
-                        ProcessName = ExtractProcessName(desc) ?? "Unknown"
+                        Category = currentCategory switch
+                        {
+                            "DISPLAY" or "ДИСПЛЕЙ" => PowerCategory.Display,
+                            "SYSTEM" or "СИСТЕМА" => PowerCategory.System,
+                            "EXECUTION" or "ВЫПОЛНЕНИЕ" => PowerCategory.Execution,
+                            "AWAYMODE" => PowerCategory.AwayMode,
+                            _ => PowerCategory.Unknown
+                        },
+                        ProcessName = line.Trim(),
+                        RawDescription = line.Trim()
                     });
                 }
             }
 
             return requests;
-        }
-
-        /// <summary>
-        /// Парсит категорию блокировки из строки
-        /// </summary>
-        /// <param name="line">Строка с категорией</param>
-        /// <param name="category">Распарсенная категория</param>
-        private bool TryParseCategory(string line, out PowerCategory category)
-        {
-            category = PowerCategory.Unknown;
-
-            if (string.IsNullOrEmpty(line) || !line.EndsWith(":"))
-                return false;
-
-            var text = line.TrimEnd(':').Trim().ToUpperInvariant();
-            category = text switch
-            {
-                "DISPLAY" or "ДИСПЛЕЙ" => PowerCategory.Display,
-                "SYSTEM" or "СИСТЕМА" => PowerCategory.System,
-                "EXECUTION" or "ВЫПОЛНЕНИЕ" => PowerCategory.Execution,
-                "AWAYMODE" => PowerCategory.AwayMode,
-                "PERFBOOST" => PowerCategory.PerfBoost,
-                "ACTIVELOCKSCREEN" => PowerCategory.ActiveLockScreen,
-                _ => PowerCategory.Unknown
-            };
-
-            return category != PowerCategory.Unknown;
-        }
-
-        /// <summary>
-        /// Парсит строку с процессом в формате [PROCESS] имя
-        /// </summary>
-        /// <param name="line">Строка с процессом</param>
-        /// <param name="procName">Имя процесса</param>
-        /// <param name="procPath">Путь к процессу</param>
-        private bool TryParseProcessRequest(string line, out string? procName, out string? procPath)
-        {
-            procName = null;
-            procPath = null;
-
-            if (string.IsNullOrEmpty(line))
-                return false;
-
-            var match = Regex.Match(line, @"\[PROCESS\]\s*(.+?)(?:\.exe)?");
-
-            if (!match.Success)
-                return false;
-
-            procName = match.Groups[1].Value.Trim();
-            procPath = procName;
-
-            return true;
-        }
-
-        /// <summary>
-        /// Парсит обычную строку блокировки (не процесс)
-        /// </summary>
-        /// <param name="line">Строка блокировки</param>
-        /// <param name="desc">Описание блокировки</param>
-        private bool TryParseGenericRequest(string line, out string? desc)
-        {
-            desc = null;
-
-            if (string.IsNullOrEmpty(line))
-                return false;
-
-            var skip = new[] { "Нет.", "Ни один.", "None.", "сек)", "min)" };
-
-            foreach (var s in skip)
-                if (line.Contains(s))
-                    return false;
-
-            desc = line.Trim();
-
-            return true;
-        }
-
-        /// <summary>
-        /// Извлекает имя .exe из строки описания
-        /// </summary>
-        /// <param name="desc">Строка описания</param>
-        private string? ExtractProcessName(string desc)
-        {
-            if (string.IsNullOrEmpty(desc))
-                return null;
-
-            var match = Regex.Match(desc, @"([a-zA-Z0-9_\-]+\.exe)", RegexOptions.IgnoreCase);
-            return match.Success ? match.Groups[1].Value : null;
         }
     }
 }
